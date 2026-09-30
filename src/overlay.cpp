@@ -8,7 +8,9 @@
 
 #include "sessions.hpp"
 #include <Geode/Geode.hpp>
+#ifdef GEODE_IS_DESKTOP
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
+#endif
 #include <imgui-cocos.hpp>
 #include <algorithm>
 #include <array>
