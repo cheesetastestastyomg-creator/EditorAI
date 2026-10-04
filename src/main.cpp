@@ -10824,7 +10824,17 @@ protected:
             Notification::create(
                 "Generation continues in background", NotificationIcon::Info)->show();
         }
+        Ref<AIGeneratorPopup> keepAlive = this;
         Popup::onClose(sender);
+        // Removal pauses/cleans up this node's scheduler entries. Network
+        // callbacks survive through the session, so restore the matching
+        // background ticks too; otherwise queue polling stops on close.
+        if (m_isGenerating || m_isCreatingObjects)
+            scheduleAlways(schedule_selector(AIGeneratorPopup::updateObjectCreation), 0.05f);
+        if (m_isGenerating)
+            scheduleAlways(schedule_selector(AIGeneratorPopup::updateGenerationTimer), 1.f);
+        if (!m_platinumRequestId.empty())
+            scheduleAlways(schedule_selector(AIGeneratorPopup::pollPlatinumResult), 1.f);
     }
 
     void onCancel(CCObject*) {
@@ -11186,7 +11196,7 @@ protected:
     // model what's out there so rect:/id: selectors can still reach it.
     std::vector<Ref<GameObject>> m_editInventory;
 
-    std::string buildLevelInventoryListing(int cap) {
+    std::string buildLevelInventoryListing(int cap, size_t charBudget = 0) {
         m_editInventory.clear();
         // Self-revalidate (stale-pointer safe) like the other build* helpers —
         // a freed-but-non-null m_editorLayer here would be a use-after-free
@@ -11211,29 +11221,40 @@ protected:
         std::string out;
         int listed = (int)std::min<size_t>(objs.size(), (size_t)cap);
         out.reserve((size_t)listed * 40);
-        out += fmt::format("OBJECT INVENTORY ({} objects total, first {} listed; "
-                           "#index is stable for THIS turn's MOVE/DELETE/EDIT):\n",
-                           objs.size(), listed);
         for (int i = 0; i < listed; ++i) {
             auto* go = objs[i];
             auto it = idToName.find(go->m_objectID);
             std::string name = it != idToName.end()
                 ? it->second : fmt::format("obj{}", go->m_objectID);
-            out += fmt::format("#{} {} x={:.0f} y={:.0f}",
+            std::string line = fmt::format("#{} {} x={:.0f} y={:.0f}",
                 i, name, go->getPositionX(), go->getPositionY());
             float rot = go->getRotation();
-            if (std::abs(rot) > 0.01f) out += fmt::format(" r={:.0f}", rot);
+            if (std::abs(rot) > 0.01f) line += fmt::format(" r={:.0f}", rot);
             float scl = go->getScale();
-            if (std::abs(scl - 1.f) > 0.01f) out += fmt::format(" s={:.2f}", scl);
-            out += "\n";
+            if (std::abs(scl - 1.f) > 0.01f) line += fmt::format(" s={:.2f}", scl);
+            line += "\n";
+            if (charBudget && out.size() + line.size() + 512 > charBudget) {
+                listed = i;
+                break;
+            }
+            out += line;
         }
+        out = fmt::format("OBJECT INVENTORY ({} objects total, first {} listed; "
+                          "#index is stable for THIS turn's MOVE/DELETE/EDIT):\n",
+                          objs.size(), listed) + out;
         if ((int)objs.size() > listed) {
             out += "DENSITY BEYOND THE LISTING (use rect:/id: selectors there):\n";
             std::map<int, int> buckets;
             for (size_t i = listed; i < objs.size(); ++i)
                 ++buckets[(int)(objs[i]->getPositionX() / 500.f)];
-            for (auto& [b, n] : buckets)
-                out += fmt::format("  X {}-{}: {} objects\n", b * 500, b * 500 + 500, n);
+            for (auto& [b, n] : buckets) {
+                auto line = fmt::format("  X {}-{}: {} objects\n", b * 500, b * 500 + 500, n);
+                if (charBudget && out.size() + line.size() + 128 > charBudget) {
+                    out += "  (remaining regions omitted; rect:/id: selectors still cover the whole level)\n";
+                    break;
+                }
+                out += line;
+            }
         }
         m_editInventory.assign(objs.begin(), objs.begin() + listed);
         return out;
@@ -12935,7 +12956,7 @@ protected:
 
     // ── System prompt ─────────────────────────────────────────────────────────
 
-    std::string buildSystemPrompt() {
+    std::string buildSystemPrompt(bool includeExamples = true) {
         bool advFeatures   = Mod::get()->getSettingValue<bool>("enable-advanced-features");
 
         // ── Mode preface (Creation vs Edit) ───────────────────────────────
@@ -12949,7 +12970,14 @@ protected:
         // In Creation mode, we lead with a "build from scratch" framing that
         // tells the model the level is empty.
         std::string modePrefix;
-        if (m_editMode) {
+        if (m_followUpTurn) {
+            modePrefix = m_followUpMode == 0
+                ? "MODE: FOLLOW-UP EDIT. The level already exists. Reply to the current request; "
+                  "change only the requested parts through edit operations/additions. "
+                  "Never replace the whole level unless explicitly requested.\n\n"
+                : "MODE: READ-ONLY FOLLOW-UP. Answer the current question or build plan in plain text. "
+                  "Do not emit EAS, JSON objects, or edit operations. The grammar below is reference only.\n\n";
+        } else if (m_editMode) {
             int existingCount = (m_editorLayer && m_editorLayer->m_objects)
                 ? m_editorLayer->m_objects->count() : 0;
             modePrefix = fmt::format(
@@ -13330,7 +13358,7 @@ protected:
         // Few-shot examples — real .gmd slices matched to the requested
         // style. Capped at 1 to keep the prompt small; each example is the raw
         // objects array (X normalized to 0).
-        if (!EXAMPLE_SECTIONS.empty()) {
+        if (includeExamples && !EXAMPLE_SECTIONS.empty()) {
             int wantPicks = 1;
             auto picks = pickExampleIndices(s_lastDifficulty, s_lastStyle, wantPicks);
             if (!picks.empty()) {
@@ -13363,7 +13391,7 @@ protected:
         // (matching difficulty/style/length), then by rating.
         // Guard: cap total feedback injection at ~8000 chars (~2000 tokens)
         // to avoid blowing up context windows on smaller models.
-        if (Mod::get()->getSettingValue<bool>("enable-rating")) {
+        if (includeExamples && Mod::get()->getSettingValue<bool>("enable-rating")) {
             int maxExamples = (int)Mod::get()->getSettingValue<int64_t>("max-feedback-examples");
             auto curDiff  = s_lastDifficulty;
             auto curStyle = s_lastStyle;
@@ -13453,7 +13481,7 @@ protected:
                 "object of that type). rect/id may add type=NAME to filter. "
                 "One bulk line can touch hundreds of objects. Ops run in "
                 "order at apply time and are previewed/reversible.\n";
-        if (m_editMode) {
+        if (m_editMode || (m_followUpTurn && m_followUpMode == 0)) {
             base += "\nEDIT MODE DOCTRINE: think like a level designer doing a "
                     "serious revision pass, not a patcher. Combine MOVE/DELETE/"
                     "EDIT/additions across the WHOLE level: re-space bad pacing "
@@ -14453,12 +14481,15 @@ protected:
     // the scene: it forwards `!m_bRunning` as the scheduler's `bPaused`. The overlay's
     // generation path NEVER shows this popup (editoraiStartGeneration builds a
     // headless engine), so anything scheduled the normal way silently never
-    // ticks there. These two helpers register straight on the scheduler with
-    // bPaused=false, so a tick runs whether the popup is on screen or not.
+    // ticks there. Pause state is shared by ALL selectors on a target: adding
+    // another selector with bPaused=false does not resume an existing entry.
+    // Resume before registration (also avoids a paused-state debug assertion).
     // (The scheduler retains its target, so the engine can't die mid-tick.)
     void scheduleAlways(cocos2d::SEL_SCHEDULE sel, float interval) {
-        if (auto* sch = this->getScheduler())
+        if (auto* sch = this->getScheduler()) {
+            sch->resumeTarget(this);
             sch->scheduleSelector(sel, this, interval, false);
+        }
     }
     void unscheduleAlways(cocos2d::SEL_SCHEDULE sel) {
         if (auto* sch = this->getScheduler())
@@ -15366,9 +15397,15 @@ protected:
         if (m_goalActive && !m_goalText.empty())
             out += fmt::format("Active goal: {}\n{}\n", m_goalText,
                                goalTaskListText());
-        if (m_session && !m_session->chatSummary.empty())
+        if (m_session && !m_session->chatSummary.empty()) {
+            std::string digest = m_session->chatSummary;
+            if (m_followUpTurn && !m_usingToolLoop && digest.size() > 2000) {
+                GenSession::utf8Trim(digest, 2000);
+                digest += "\n[Older digest condensed for this request; full memory remains saved.]";
+            }
             out += "\nEarlier conversation digest (context, not a new request):\n" +
-                   m_session->chatSummary;
+                   digest;
+        }
         return out;
     }
 
@@ -17604,7 +17641,9 @@ protected:
 
         log::info("Calling {} API with model: {}", provider, model);
 
-        std::string systemPrompt = buildSystemPrompt();
+        // Follow-ups retain the complete grammar/safety guidance, but do not
+        // need fresh few-shot level dumps and rated generations every turn.
+        std::string systemPrompt = buildSystemPrompt(!m_followUpTurn);
         appendModeContext(systemPrompt);
         if (!m_styleRefId.empty() && !m_styleBrief.empty() && m_styleBrief != "(unavailable)") {
             systemPrompt += "\n\nMATCH THIS VISUAL STYLE (reference level the user picked):\n";
@@ -17625,7 +17664,23 @@ protected:
         // When clear level is ON, there is no useful context to send.
         // The full level JSON is also logged here for debugging.
         std::string levelDataSection;
-        if (m_editMode) {
+        if (m_followUpTurn) {
+            if (m_followUpMode == 0 && revalidateEditor()) {
+                // One fresh, stable inventory, sized AFTER the system and
+                // conversation. Bulk selectors still reach unlisted regions.
+                size_t used = systemPrompt.size() + prompt.size() + 2048;
+                size_t budget = used < 28000 ? std::min<size_t>(6000, 28000 - used) : 0;
+                if (budget >= 512)
+                    levelDataSection = "\n\n" + buildLevelInventoryListing(1500, budget);
+                else {
+                    buildLevelInventoryListing(0); // do not resolve stale #indices
+                    levelDataSection = "\n\n" + workingStateLine() +
+                        "\nNo individual #indices are listed. Use rect:/id: bulk selectors.";
+                }
+            }
+            // Read-only chat/plan turns use the authoritative state summary
+            // already in the system envelope, not hundreds of object records.
+        } else if (m_editMode) {
             // Edit runs get the numbered inventory so MOVE/DELETE/EDIT
             // selectors resolve against exactly what the model saw — even
             // on single-shot providers (tools off, Platinum, custom).
@@ -17659,6 +17714,11 @@ protected:
             prompt, difficulty, style, length, levelDataSection
         );
         fullPrompt += buildBeatGridNote(prompt);
+        if (m_followUpTurn) {
+            // Do not wrap a conversation as another request to generate a
+            // complete replacement, or duplicate the inventory in history.
+            fullPrompt = prompt + levelDataSection;
+        }
 
         // Seed the conversation log so follow-up chat works for single-shot
         // generations too (edit mode, tools off, Platinum, or custom provider
@@ -18216,6 +18276,7 @@ protected:
         m_platinumPollInFlight = false;
         setFlowPhase("waiting for Platinum");
         showStatus("Platinum queued - waiting for a worker...");
+        log::info("Platinum queued request {}; polling for its result", requestId);
         scheduleAlways(schedule_selector(AIGeneratorPopup::pollPlatinumResult), 1.f);
         // Start immediately; the scheduled tick handles subsequent polls.
         pollPlatinumResult(0.f);
@@ -18273,10 +18334,13 @@ protected:
                 }
                 auto statusResult = json["status"].asString();
                 std::string status = statusResult ? statusResult.unwrap() : "";
+                if (status != m_platinumPollStatus)
+                    log::info("Platinum request {}: {} (HTTP {})",
+                              m_platinumRequestId, status, response.code());
                 if (status == "pending" || status == "processing" || status == "queued") {
                     m_platinumPollStatus = status;
                     setFlowPhase(status == "processing" ? "Platinum working" : "waiting for Platinum");
-                    showLiveStatus(status == "pending"
+                    showLiveStatus(status != "processing"
                         ? "Platinum: queued..."
                         : "Platinum: model is working...");
                     return;
@@ -18688,6 +18752,32 @@ public:
     // never emits objects), 2 = chat (conversational answer, never a script).
     // echoUser=false when the message was already echoed to the transcript
     // (queued edits show the moment they're typed, not when they run).
+    static std::string bufferedFollowUpPrompt(const std::vector<toolUse::Message>& history,
+                                             const std::string& newest) {
+        std::string context;
+        size_t remaining = 2400;
+        size_t taken = 0;
+        // The newest user message is passed separately and NEVER truncated.
+        auto it = history.rbegin();
+        if (it != history.rend()) ++it;
+        for (; it != history.rend() && remaining > 0 && taken < 6; ++it) {
+            if (it->role != toolUse::MessageRole::User &&
+                it->role != toolUse::MessageRole::Assistant) continue;
+            if (it->text.empty()) continue;
+            ++taken;
+            std::string old = it->text;
+            size_t cap = std::min<size_t>(800, remaining);
+            bool trimmed = old.size() > cap;
+            GenSession::utf8Trim(old, cap);
+            remaining -= std::min(remaining, old.size());
+            if (trimmed) old += " [older turn condensed]";
+            context = (it->role == toolUse::MessageRole::Assistant
+                ? "Earlier assistant: " : "Earlier user: ") + old + "\n\n" + context;
+        }
+        return "Earlier conversation (context only; current level snapshot takes precedence):\n" +
+            context + "\nCURRENT USER REQUEST (answer this in full):\n" + newest;
+    }
+
     void sendFollowUp(const std::string& text, int mode = 0, bool echoUser = true) {
         if (text.empty()) return;
         if (m_isGenerating) {
@@ -18716,6 +18806,10 @@ public:
         m_toolCallSigCounts.clear();
         m_shouldClearLevel = false;      // follow-ups always modify additively
         m_accumulatedObjects = matjson::Value::array();
+        std::string provider = Mod::get()->getSettingValue<std::string>("ai-provider");
+        bool platinum = provider == "ollama" && Mod::get()->getSettingValue<bool>("use-platinum");
+        bool toolsEnabled = Mod::get()->getSettingValue<bool>("enable-ai-tools");
+        m_usingToolLoop = toolsEnabled && toolUse::supportsToolUse(provider) && !platinum;
 
         std::string modeNote;
         if (mode == 1) {
@@ -18741,7 +18835,7 @@ public:
                     : std::string());
             // The numbered inventory the selectors resolve against — rebuilt
             // every edit turn so indices always match what the model sees.
-            if (revalidateEditor()) {
+            if (m_usingToolLoop && revalidateEditor()) {
                 modeNote += "\n\n" + buildLevelInventoryListing(1500);
             }
         }
@@ -18840,32 +18934,11 @@ public:
         // Everyone else (custom endpoint, Platinum — whose coordinator has
         // no /api/chat) gets a single-shot follow-up: the recent exchange is
         // serialized into one prompt and sent through the normal API path.
-        std::string provider = Mod::get()->getSettingValue<std::string>("ai-provider");
-        bool platinum = provider == "ollama" &&
-            Mod::get()->getSettingValue<bool>("use-platinum");
-        bool toolsEnabled = Mod::get()->getSettingValue<bool>("enable-ai-tools");
-        m_usingToolLoop = toolsEnabled && toolUse::supportsToolUse(provider) && !platinum;
         if (m_usingToolLoop) {
             this->doToolRound();
             return;
         }
-        std::string convo;
-        int taken = 0;
-        for (auto it = m_toolHistory.rbegin();
-             it != m_toolHistory.rend() && taken < 6; ++it) {
-            if (it->role == toolUse::MessageRole::System ||
-                it->role == toolUse::MessageRole::ToolResults) continue;
-            std::string t = it->text;
-            if (t.empty()) continue;
-            if (t.size() > 1500) { t.resize(1500); t += " [...]"; }
-            convo = fmt::format("{}: {}\n\n",
-                it->role == toolUse::MessageRole::Assistant
-                    ? "You previously said" : "User said", t) + convo;
-            ++taken;
-        }
-        std::string followPrompt = fmt::format(
-            "(Conversation so far - newest last)\n{}"
-            "Reply to the user's newest message above.", convo);
+        std::string followPrompt = bufferedFollowUpPrompt(m_toolHistory, text + modeNote);
         this->callAPI(followPrompt, getProviderApiKey(provider));
     }
 
