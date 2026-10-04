@@ -1449,6 +1449,10 @@ inline matjson::Value buildOpenAICompatRequest(const std::string& provider,
         // temperature/max_tokens — its knobs live in "options".
         auto options = matjson::Value::object();
         options["temperature"] = 0.7;
+        // Platinum workers run models with different Ollama defaults. Make
+        // the context/output envelope explicit so a worker's small default
+        // context does not reject an otherwise valid request.
+        options["num_ctx"] = 16384;
         options["num_predict"] = tokenLimitSpec(provider).limit;
         body["options"] = options;
     } else {
@@ -2871,6 +2875,13 @@ static std::pair<std::string, std::string> parseAPIError(const std::string& erro
                 "or switch to a faster model/provider in settings.",
                 code, errorMsg);
 
+        } else if (statusCode == 503 &&
+                   errorMsg.find("No workers available") != std::string::npos) {
+            title = "Platinum Model Unavailable";
+            code = autoErrorCode(80, 4);
+            msg = fmtUserError("No worker can run the selected model.",
+                "Refresh the Platinum model list and choose an available model.",
+                code, errorMsg);
         } else if (statusCode >= 500) {
             title = fmt::format("Service Error (HTTP {})", statusCode);
             code  = autoErrorCode(50, std::min(statusCode - 500, 99));
@@ -8992,6 +9003,8 @@ public:
 // Ring buffer of the last API exchanges (request + response, truncated).
 // Filled by the generator's send/receive paths; surfaced by the debug popup.
 struct RequestLogEntry {
+    uint64_t id = 0;
+    std::chrono::steady_clock::time_point started;
     std::string provider, model, url;
     std::string requestBody;   // truncated to 4 KB
     std::string responseBody;  // truncated to 4 KB
@@ -9000,12 +9013,13 @@ struct RequestLogEntry {
     int64_t     timestamp = 0;
 };
 static std::deque<RequestLogEntry> s_requestLog;
-static std::chrono::steady_clock::time_point s_requestStart;
-static bool s_requestPending = false;
+static uint64_t s_nextRequestId = 0;
 
-static void logApiRequest(const std::string& provider, const std::string& model,
+static uint64_t logApiRequest(const std::string& provider, const std::string& model,
                           const std::string& url, const std::string& body) {
     RequestLogEntry e;
+    e.id = ++s_nextRequestId;
+    e.started = std::chrono::steady_clock::now();
     e.provider = provider;
     e.model    = model;
     e.url      = url;
@@ -9015,17 +9029,17 @@ static void logApiRequest(const std::string& provider, const std::string& model,
     s_requestLog.push_back(std::move(e));
     // 7 = what the inspector popup's touch rect fits (178px / 24px rows).
     while (s_requestLog.size() > 7) s_requestLog.pop_front();
-    s_requestStart   = std::chrono::steady_clock::now();
-    s_requestPending = true;
+    return s_nextRequestId;
 }
 
-static void logApiResponse(int code, const std::string& body) {
-    if (!s_requestPending || s_requestLog.empty()) return;
-    s_requestPending = false;
-    auto& e = s_requestLog.back();
+static void logApiResponse(int code, const std::string& body, uint64_t id) {
+    auto it = std::find_if(s_requestLog.begin(), s_requestLog.end(),
+        [id](const auto& e) { return e.id == id; });
+    if (it == s_requestLog.end()) return;
+    auto& e = *it;
     e.httpCode  = code;
     e.latencyMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - s_requestStart).count();
+        std::chrono::steady_clock::now() - e.started).count();
     e.responseBody = body.size() > 4096 ? body.substr(0, 4096) + "\n...(truncated)" : body;
 }
 
@@ -10114,6 +10128,19 @@ protected:
     CCSprite*                m_chipDot   = nullptr;
     std::string              m_chipProviderShown;
     async::TaskHolder<web::WebResponse> m_platinumPoll;
+    // Platinum's coordinator may acknowledge /api/generate immediately with
+    // a request_id instead of holding the HTTP request open. Poll the result
+    // endpoint until the worker finishes; this is deliberately separate from
+    // m_platinumPoll, which only refreshes the small queue-status label.
+    async::TaskHolder<web::WebResponse> m_platinumResultTask;
+    async::TaskHolder<web::WebResponse> m_platinumModelCheck;
+    uint64_t m_requestLogId = 0;
+    uint64_t m_platinumPollLogId = 0;
+    std::string m_platinumPollStatus;
+    std::string              m_platinumRequestId;
+    std::chrono::steady_clock::time_point m_platinumDeadline{};
+    bool                     m_platinumPollInFlight = false;
+    std::function<void(std::string)> m_platinumConsultantDone;
     async::TaskHolder<web::WebResponse> m_subagentTask;
     bool                     m_mutationMode = false;    // Mutate button flow
     bool                     m_coopMode     = false;    // AI-continues-your-build flow
@@ -10635,18 +10662,17 @@ protected:
                 const auto& coord = j["coordinator"];
                 auto queued  = coord["queued_requests"].asInt();
                 auto active  = coord["active_workers"].asInt();
-                auto workers = coord["workers"].asInt();
                 int q = queued  ? (int)queued.unwrap()  : 0;
-                int a = active  ? (int)active.unwrap()  : 0;
-                int w = workers ? (int)workers.unwrap() : 0;
+                int w = active ? (int)active.unwrap() : 0;
+                int busy = coord["processing_requests"].asInt().unwrapOr(0);
                 if (w <= 0)
                     m_platinumStatus = "Platinum: no workers online";
-                else if (q <= 0)
+                else if (q <= 0 && busy <= 0)
                     m_platinumStatus = fmt::format("Platinum: idle ({} worker{})",
                                                    w, w == 1 ? "" : "s");
                 else
-                    m_platinumStatus = fmt::format("Platinum: {} queued, {}/{} busy",
-                                                   q, a, w);
+                    m_platinumStatus = fmt::format("Platinum: {} queued, {} jobs / {} online",
+                                                   q, busy, w);
                 m_lastCostPrompt.clear();  // force the cost label to refresh
             });
     }
@@ -10804,6 +10830,10 @@ protected:
     void onCancel(CCObject*) {
         if (!m_isGenerating) return;
         m_listener = {};  // destroy the task holder, cancelling the request
+        m_subagentTask = {};
+        m_platinumModelCheck = {};
+        m_platinumConsultantDone = {};
+        stopPlatinumResultPoll();
         // Also cancel any in-flight TOOL requests — with parallel tool
         // execution these run on their own holders, and a surviving callback
         // would push results into m_toolHistory and silently restart the
@@ -10990,7 +11020,18 @@ protected:
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_generationStartTime).count();
-        showLiveStatus(fmt::format("working... {}s", elapsed));
+        if (!m_platinumRequestId.empty()) {
+            showLiveStatus(fmt::format("Platinum: {}... {}s",
+                m_platinumPollStatus == "processing" ? "working" : "queued", elapsed));
+        } else {
+            showLiveStatus(fmt::format("working... {}s", elapsed));
+        }
+        // Headless engines never tick their scene-paused idle status selector.
+        // Reuse the already-unpaused generation timer without retaining an
+        // idle engine indefinitely with another always-running selector.
+        if (!getParent() && elapsed % 5 == 0 &&
+            Mod::get()->getSettingValue<bool>("use-platinum"))
+            pollPlatinumStatus(0.f);
     }
 
     // ── Level manipulation ────────────────────────────────────────────────────
@@ -14816,7 +14857,7 @@ protected:
         log::info("Tool round {}: POST {} ({} bytes)",
                   m_toolIterations, url, bodyStr.size());
 
-        logApiRequest(m_toolProvider, m_toolModel, url, bodyStr);
+        m_requestLogId = logApiRequest(m_toolProvider, m_toolModel, url, bodyStr);
 
         auto request = web::WebRequest();
         request.header("Content-Type", "application/json");
@@ -14888,7 +14929,7 @@ protected:
     }
 
     void onToolRoundResponse(web::WebResponse resp) {
-        logApiResponse(resp.code(), resp.string().unwrapOr(""));
+        logApiResponse(resp.code(), resp.string().unwrapOr(""), m_requestLogId);
         if (!resp.ok()) {
             if (this->retryToolRoundIfTransient(resp.code())) return;
             auto [title, msg] = parseAPIError(
@@ -15079,7 +15120,8 @@ protected:
                                 const std::string& question,
                                 std::function<void(std::string)> onDone)
     {
-        const bool platinum = provider == "platinum";
+        const bool platinum = provider == "platinum" ||
+            (provider == "ollama" && Mod::get()->getSettingValue<bool>("use-platinum"));
         const std::string apiProvider = platinum ? "ollama" : provider;
         std::string model = selectedModel.empty()
             ? getProviderModel(apiProvider) : selectedModel;
@@ -15131,6 +15173,10 @@ protected:
             body["model"] = model;
             body["prompt"] = fmt::format("{}\n\n{}", SUB_SYS, question);
             body["stream"] = false;
+            auto options = matjson::Value::object();
+            options["num_ctx"] = 16384;
+            options["num_predict"] = 1024;
+            body["options"] = options;
             url = (platinum ? std::string("http://sn-1.vltgg.net:21800")
                             : getOllamaUrl()) + "/api/generate";
         } else {
@@ -15150,16 +15196,34 @@ protected:
         applyProviderAuth(request, apiProvider, apiKey);
         request.bodyString(body.dump());
         log::info("ask_subagent -> {} ({})", provider, model);
+        auto subLogId = logApiRequest(provider, model, url, body.dump());
         m_subagentTask.spawn(
             request.post(url),
-            [apiProvider, onDone = std::move(onDone)](web::WebResponse resp) mutable {
+            [this, apiProvider, platinum, subLogId, onDone = std::move(onDone)](web::WebResponse resp) mutable {
+                if (!m_isGenerating) return;
+                logApiResponse(resp.code(), resp.string().unwrapOr(""), subLogId);
                 if (!resp.ok()) {
-                    onDone(fmt::format("(subagent HTTP {})", resp.code()));
+                    auto [title, detail] = parseAPIError(resp.string().unwrapOr(""), resp.code());
+                    onDone(fmt::format("(consultant unavailable: {}: {})", title, detail));
                     return;
                 }
-                auto json = resp.json();
-                if (!json) { onDone("(subagent returned non-JSON)"); return; }
-                const auto j = json.unwrap();
+                matjson::Value j;
+                if (!parseOllamaBody(resp.string().unwrapOr(""), j)) {
+                    onDone("(subagent returned non-JSON)"); return;
+                }
+                if (platinum) {
+                    auto id = j["request_id"].asString();
+                    if (id && !id.unwrap().empty()) {
+                        m_platinumConsultantDone = std::move(onDone);
+                        beginPlatinumResultPoll(id.unwrap(), subLogId);
+                        return;
+                    }
+                    auto error = j["error"].asString();
+                    if (error && !error.unwrap().empty()) {
+                        onDone("(Platinum consultant: " + error.unwrap() + ")");
+                        return;
+                    }
+                }
                 std::string text;
                 if (apiProvider == "claude") {
                     if (j.contains("content") && j["content"].isArray() && j["content"].size() > 0) {
@@ -16331,6 +16395,7 @@ protected:
     // Shared "generation finished (one way or another)" UI reset: hide the
     // cancel button, restore Generate.
     void resetGenerationUI() {
+        stopPlatinumResultPoll();
         m_isGenerating = false;
         if (m_session) m_session->liveStatus.clear();   // stop the "working..." line
         m_cancelBtn->setVisible(false);
@@ -17435,7 +17500,8 @@ protected:
         }
     }
 
-    void callAPI(const std::string& prompt, const std::string& rawApiKey) {
+    void callAPI(const std::string& prompt, const std::string& rawApiKey,
+                 bool modelChecked = false) {
         // Stashed for the transient-failure retry in onAPISuccess.
         m_lastCallPrompt = prompt;
         m_lastCallKey    = rawApiKey;
@@ -17478,6 +17544,36 @@ protected:
         // needs /api/chat, which 404s there. Force single-shot on Platinum.
         bool platinum = provider == "ollama" &&
             Mod::get()->getSettingValue<bool>("use-platinum");
+        if (platinum && !modelChecked) {
+            showStatus("Checking Platinum model...");
+            auto check = web::WebRequest();
+            check.timeout(std::chrono::seconds(15));
+            m_platinumModelCheck.spawn(check.get(getOllamaUrl() + "/api/tags"),
+                [this, prompt, rawApiKey, model](web::WebResponse response) {
+                    if (!m_isGenerating) return;
+                    auto tags = response.json();
+                    if (!response.ok() || !tags || !tags.unwrap()["models"].isArray()) {
+                        onError("Platinum Unavailable", "Could not check models. Retry.");
+                        return;
+                    }
+                    bool found = false;
+                    for (const auto& entry : tags.unwrap()["models"].asArray().unwrap())
+                        if (entry["name"].asString().unwrapOr("") == model ||
+                            entry["model"].asString().unwrapOr("") == model) found = true;
+                    if (!found) {
+                        onError("Platinum Model Unavailable",
+                            "This model is not advertised by Platinum. Refresh models and select an available one.");
+                        return;
+                    }
+                    if (getProviderModel("ollama") != model ||
+                        !Mod::get()->getSettingValue<bool>("use-platinum")) {
+                        onError("Settings Changed", "Provider changed. Generate again.");
+                        return;
+                    }
+                    callAPI(prompt, rawApiKey, true);
+                });
+            return;
+        }
         // Mutation skips the tool loop: it's a targeted single-shot change
         // with the whole level already in context — web/NG tools just burn
         // rounds. Co-op keeps tools (the model may want references).
@@ -17663,6 +17759,18 @@ protected:
 
             auto options = matjson::Value::object();
             options["temperature"] = 0.7;
+            // Keep Platinum/local Ollama requests within a known envelope;
+            // otherwise the model's installation default can be as small as
+            // 4K and reject the system prompt plus a normal level draft.
+            options["num_ctx"] = 16384;
+            // A conservative estimate, not a tokenizer guarantee. Reserve
+            // room for output instead of requesting 8K on top of a full 16K input.
+            auto inputEstimate = (systemPrompt.size() + fullPrompt.size() + 1) / 2;
+            if (inputEstimate > 14000) {
+                onError("Context Too Large", "Edit a smaller region or shorten the request.");
+                return;
+            }
+            options["num_predict"] = static_cast<int>(std::min<size_t>(8192, 15360 - inputEstimate));
 
             requestBody            = matjson::Value::object();
             requestBody["model"]   = model;
@@ -17738,7 +17846,7 @@ protected:
         request.timeout(providerTimeout(provider));
 
         request.bodyString(jsonBody);
-        logApiRequest(provider, model, url, jsonBody);
+        m_requestLogId = logApiRequest(provider, model, url, jsonBody);
         m_listener.spawn(
             request.post(url),
             [this, provider](web::WebResponse response) {
@@ -18050,32 +18158,251 @@ protected:
     }
     protected:
 
+    // Platinum deployments are not all on the same coordinator revision.
+    // Newer ones can hold /api/generate open, while older/proxy-compatible
+    // ones return a queue acknowledgement and require GET /api/result/{id}.
+    // Accept both forms so the acknowledgement is never mistaken for an
+    // empty model response.
+    static bool parseOllamaBody(const std::string& body, matjson::Value& out) {
+        auto direct = matjson::parse(body);
+        if (direct) {
+            out = direct.unwrap();
+            return true;
+        }
+        // A coordinator long-poll is Ollama-style NDJSON. WebRequest buffers
+        // it for us (streaming is intentionally removed from the mod), so use
+        // the last valid line — keepalives and progress lines are harmless.
+        size_t end = body.size();
+        while (end > 0 && (body[end - 1] == '\n' || body[end - 1] == '\r')) --end;
+        while (end > 0) {
+            size_t begin = body.rfind('\n', end - 1);
+            begin = begin == std::string::npos ? 0 : begin + 1;
+            std::string line = body.substr(begin, end - begin);
+            auto parsed = matjson::parse(line);
+            if (parsed) {
+                auto value = parsed.unwrap();
+                // Never mistake a truncated keepalive-only body for a result.
+                if (value["done"].asBool().unwrapOr(false) ||
+                    value.contains("error") || value.contains("request_id")) {
+                    out = std::move(value);
+                    return true;
+                }
+            }
+            if (begin == 0) break;
+            end = begin - 1;
+            while (end > 0 && (body[end - 1] == '\n' || body[end - 1] == '\r')) --end;
+        }
+        return false;
+    }
+
+    void stopPlatinumResultPoll() {
+        if (!m_platinumRequestId.empty())
+            unscheduleAlways(schedule_selector(AIGeneratorPopup::pollPlatinumResult));
+        m_platinumResultTask = {};
+        m_platinumRequestId.clear();
+        m_platinumPollStatus.clear();
+        m_platinumPollInFlight = false;
+        m_platinumDeadline = {};
+    }
+
+    void beginPlatinumResultPoll(const std::string& requestId, uint64_t logId = 0) {
+        if (requestId.empty()) return;
+        m_platinumRequestId = requestId;
+        m_platinumPollStatus = "queued";
+        m_platinumPollLogId = logId ? logId : m_requestLogId;
+        m_platinumDeadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(std::min<int64_t>(360,
+                Mod::get()->getSettingValue<int64_t>("ollama-timeout")));
+        m_platinumPollInFlight = false;
+        setFlowPhase("waiting for Platinum");
+        showStatus("Platinum queued - waiting for a worker...");
+        scheduleAlways(schedule_selector(AIGeneratorPopup::pollPlatinumResult), 1.f);
+        // Start immediately; the scheduled tick handles subsequent polls.
+        pollPlatinumResult(0.f);
+    }
+
+    void failPlatinumRequest(const std::string& title, const std::string& detail) {
+        stopPlatinumResultPoll();
+        if (m_platinumConsultantDone) {
+            auto done = std::move(m_platinumConsultantDone);
+            m_platinumConsultantDone = {};
+            done("(Platinum consultant unavailable: " + detail + ")");
+        } else {
+            onError(title, detail);
+        }
+    }
+
+    void pollPlatinumResult(float) {
+        if (!m_isGenerating || m_platinumRequestId.empty()) {
+            stopPlatinumResultPoll();
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= m_platinumDeadline) {
+            failPlatinumRequest("Platinum Timeout",
+                fmt::format("Platinum did not finish within {} seconds. Try again when "
+                            "a worker is available, or use another provider. ({})",
+                            std::min<int64_t>(360, Mod::get()->getSettingValue<int64_t>("ollama-timeout")),
+                            autoErrorCode(80, 3)));
+            return;
+        }
+        if (m_platinumPollInFlight) return;
+        m_platinumPollInFlight = true;
+        auto request = web::WebRequest();
+        request.timeout(std::chrono::seconds(15));
+        std::string url = "http://sn-1.vltgg.net:21800/api/result/" +
+                          m_platinumRequestId;
+        m_platinumResultTask.spawn(
+            request.get(url),
+            [this](web::WebResponse response) {
+                m_platinumPollInFlight = false;
+                if (!m_isGenerating || m_platinumRequestId.empty()) return;
+                auto body = response.string().unwrapOr("");
+                logApiResponse(response.code(), body, m_platinumPollLogId);
+                if (response.code() == 404) {
+                    failPlatinumRequest("Platinum Request Lost", "The server lost this request. Retry.");
+                    return;
+                }
+                matjson::Value json;
+                if (!parseOllamaBody(body, json)) {
+                    log::warn("Platinum result {}: HTTP {}, invalid JSON ({} bytes)",
+                              m_platinumRequestId, response.code(), body.size());
+                    if (response.ok() || (!isTransientHttp(response.code()) && response.code() > 0)) {
+                        failPlatinumRequest("Platinum Protocol Error", "Invalid result reply. Retry.");
+                    }
+                    return;
+                }
+                auto statusResult = json["status"].asString();
+                std::string status = statusResult ? statusResult.unwrap() : "";
+                if (status == "pending" || status == "processing" || status == "queued") {
+                    m_platinumPollStatus = status;
+                    setFlowPhase(status == "processing" ? "Platinum working" : "waiting for Platinum");
+                    showLiveStatus(status == "pending"
+                        ? "Platinum: queued..."
+                        : "Platinum: model is working...");
+                    return;
+                }
+                if (status == "failed" || status == "timeout") {
+                    auto errResult = json["error"].asString();
+                    std::string detail = errResult && !errResult.unwrap().empty()
+                        ? errResult.unwrap()
+                        : status == "timeout" ? "worker timeout" : "worker failed";
+                    failPlatinumRequest("Platinum Error",
+                        fmt::format("{} — try again when a worker is available, or "
+                                    "use another provider. ({})", detail,
+                                    autoErrorCode(80, 1)));
+                    return;
+                }
+                if (status != "completed" || !json["result"].isObject()) {
+                    log::warn("Platinum poll: HTTP {}, unexpected status {}", response.code(), status);
+                    if (!response.ok() && isTransientHttp(response.code())) return;
+                    failPlatinumRequest("Platinum Protocol Error", "Unexpected result reply. Retry.");
+                    return;
+                }
+                auto result = json["result"];
+                stopPlatinumResultPoll();
+                if (m_platinumConsultantDone) {
+                    auto done = std::move(m_platinumConsultantDone);
+                    m_platinumConsultantDone = {};
+                    auto error = result["error"].asString().unwrapOr("");
+                    done(error.empty() ? result["response"].asString().unwrapOr("(consultant returned no text)")
+                                       : "(Platinum consultant: " + error + ")");
+                    return;
+                }
+                handleOllamaPayload(result, 200, false);
+            }
+        );
+    }
+
+    void handleOllamaPayload(const matjson::Value& json, int httpCode,
+                             bool uiAlreadyReset) {
+        auto errorMsg = json["error"].asString();
+        if (errorMsg && !errorMsg.unwrap().empty()) {
+            std::string em = errorMsg.unwrap();
+            if (this->retrySingleShotIfTransient(httpCode, em)) return;
+            bool platinum = Mod::get()->getSettingValue<bool>("use-platinum");
+            onError(platinum ? "Platinum Error" : "Ollama Error",
+                platinum
+                    ? fmt::format("{} — Platinum runs on volunteer machines. Try "
+                        "again, ask for a shorter level, or switch to a direct "
+                        "provider. ({})", em, autoErrorCode(80, 1))
+                    : fmt::format("Ollama reported: {}. Check that the model is "
+                        "installed and the server is running. ({})", em,
+                        autoErrorCode(80, 1)));
+            return;
+        }
+        auto textResult = json["response"].asString();
+        if (!textResult || textResult.unwrap().empty()) {
+            bool platinum = Mod::get()->getSettingValue<bool>("use-platinum");
+            auto doneReason = json["done_reason"].asString();
+            std::string reason = doneReason && !doneReason.unwrap().empty()
+                ? fmt::format(" (finish reason: {})", doneReason.unwrap()) : "";
+            onError(platinum ? "Platinum Empty Response" : "Invalid Response",
+                platinum
+                    ? fmt::format("Platinum finished without model text{}. Try a "
+                        "shorter request or another model/provider. ({})", reason,
+                        autoErrorCode(80, 2))
+                    : fmt::format("Ollama returned an empty response{}. The model "
+                        "may have refused or exceeded its context window. ({})",
+                        reason, autoErrorCode(80, 2)));
+            return;
+        }
+        if (!uiAlreadyReset) resetGenerationUI();
+        processFinalResponse(textResult.unwrap(), "ollama");
+    }
+
     // ── API response handler ──────────────────────────────────────────────────
 
     void onAPISuccess(web::WebResponse response, const std::string& provider) {
-        logApiResponse(response.code(), response.string().unwrapOr(""));
+        const std::string responseBody = response.string().unwrapOr("");
+        logApiResponse(response.code(), responseBody, m_requestLogId);
         // Transient-failure retry runs BEFORE the UI reset so the loading
         // state survives the backoff.
         if (!response.ok()) {
             if (this->retrySingleShotIfTransient(response.code(), "")) return;
         }
 
-        resetGenerationUI();
-
         if (!response.ok()) {
             auto [title, message] = parseAPIError(
-                response.string().unwrapOr("No error details available"),
+                responseBody.empty() ? "No error details available" : responseBody,
                 response.code()
             );
-            showStatus("Failed!", true);
-            FLAlertLayer::create(title.c_str(), gd::string(message), "OK")->show();
+            onError(title, message);
             return;
+        }
+
+        // Older Platinum coordinators return a queue acknowledgement instead
+        // of holding /api/generate open. It is not an Ollama answer yet.
+        if (provider == "ollama" &&
+            Mod::get()->getSettingValue<bool>("use-platinum")) {
+            matjson::Value queued;
+            if (parseOllamaBody(responseBody, queued)) {
+                auto id = queued["request_id"].asString();
+                auto status = queued["status"].asString();
+                if (id && status && !id.unwrap().empty() &&
+                    (status.unwrap() == "queued" ||
+                     status.unwrap() == "pending" ||
+                     status.unwrap() == "processing")) {
+                    beginPlatinumResultPoll(id.unwrap());
+                    return;
+                }
+            }
         }
 
         {
             std::string aiResponse;
+            matjson::Value json;
+            bool parsed = false;
             auto jsonRes = response.json();
-            if (!jsonRes) {
+            if (jsonRes) {
+                json = jsonRes.unwrap();
+                parsed = true;
+            } else if (provider == "ollama" &&
+                       Mod::get()->getSettingValue<bool>("use-platinum")) {
+                // A newer coordinator may return buffered NDJSON from its
+                // long-poll path. Use the final valid line as the answer.
+                parsed = parseOllamaBody(responseBody, json);
+            }
+            if (!parsed) {
                 onError("Invalid Response",
                     fmt::format("The provider returned data that didn't look like JSON at all. "
                                 "This is almost always a temporary upstream outage — try again "
@@ -18084,34 +18411,9 @@ protected:
                 return;
             }
 
-            const auto json = jsonRes.unwrap();  // const: reads must not insert
-
             if (provider == "ollama") {
-                auto errorMsg = json["error"].asString();
-                if (errorMsg && !errorMsg.unwrap().empty()) {
-                    std::string em = errorMsg.unwrap();
-                    if (this->retrySingleShotIfTransient(response.code(), em))
-                        return;
-                    bool platinum = Mod::get()->getSettingValue<bool>("use-platinum");
-                    onError(platinum ? "Platinum Error" : "Ollama Error",
-                        platinum
-                            ? fmt::format("{} — Platinum runs on volunteer machines. "
-                                "Try again, ask for a shorter level, or switch to "
-                                "a direct provider. ({})", em, autoErrorCode(80, 1))
-                            : fmt::format("Ollama reported: {}. Check that the model "
-                                "is installed and the server is running. ({})",
-                                em, autoErrorCode(80, 1)));
-                    return;
-                }
-                auto textResult = json["response"].asString();
-                if (!textResult || textResult.unwrap().empty()) {
-                    onError("Invalid Response",
-                        fmt::format("Ollama returned an empty response. The model may "
-                                    "have refused or exceeded its context window. ({})",
-                                    autoErrorCode(80, 2)));
-                    return;
-                }
-                aiResponse = textResult.unwrap();
+                handleOllamaPayload(json, response.code(), false);
+                return;
 
             } else if (provider == "gemini") {
                     // Check if the entire request was blocked before generation started.
@@ -20057,18 +20359,23 @@ namespace {
     std::vector<std::string> g_ollamaModels;
     int  g_ollamaModelState = 0;      // matches the sessions.hpp contract
     bool g_ollamaFetchInFlight = false;
+    std::string g_ollamaModelUrl;
     async::TaskHolder<web::WebResponse> g_ollamaModelTask;
 }
 
 void editoraiRefreshOllamaModels() {
-    if (g_ollamaFetchInFlight) return;
+    std::string url = getOllamaUrl() + "/api/tags";
+    if (g_ollamaFetchInFlight && g_ollamaModelUrl == url) return;
+    g_ollamaModelTask = {};
+    g_ollamaModels.clear();
+    g_ollamaModelUrl = url;
     g_ollamaFetchInFlight = true;
     g_ollamaModelState = 1;  // loading
-    std::string url = getOllamaUrl() + "/api/tags";
     auto req = web::WebRequest();
     req.timeout(std::chrono::seconds(15));
     g_ollamaModelTask.spawn(req.get(url),
-        [](web::WebResponse resp) {
+        [url](web::WebResponse resp) {
+            if (url != g_ollamaModelUrl) return;
             g_ollamaFetchInFlight = false;
             if (!resp.ok()) { g_ollamaModels.clear(); g_ollamaModelState = 4; return; }
             auto jr = resp.json();
@@ -20095,6 +20402,8 @@ void editoraiRefreshOllamaModels() {
 }
 
 int editoraiGetOllamaModels(std::vector<std::string>& out) {
+    if (g_ollamaModelUrl != getOllamaUrl() + "/api/tags")
+        editoraiRefreshOllamaModels();
     out = g_ollamaModels;
     return g_ollamaModelState;
 }
