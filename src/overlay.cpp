@@ -2415,6 +2415,12 @@ static void editoraiOverlaySetup() {
         style.PopupBorderSize   = 0.f;
         style.FrameBorderSize   = 0.f;
         style.TabBarBorderSize  = 0.f;
+
+#ifdef GEODE_IS_MOBILE
+        constexpr float MOBILE_SCALE = 1.75f;
+        style.ScaleAllSizes(MOBILE_SCALE);
+        style.FontScaleMain = MOBILE_SCALE;
+#endif
         // Colors come from applyThemeFrame() every frame (user-tunable).
     }).draw([] {
         drawOverlay();
