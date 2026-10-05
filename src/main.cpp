@@ -8686,10 +8686,27 @@ protected:
         // Same headers the real generation requests use.
         applyProviderAuth(req, provider, key);
         m_authNet.spawn(req.get(url),
-            [this](web::WebResponse resp) {
-                if (resp.ok()) setAuthStatus("✓ Connected.", ui::SUCCESS_COL);
-                else setAuthStatus(fmt::format("✗ HTTP {}.", resp.code()),
-                                   ui::ERROR_COL);
+            [this, provider, key](web::WebResponse resp) {
+                if (resp.ok()) {
+                    setAuthStatus("✓ Connected.", ui::SUCCESS_COL);
+                    return;
+                }
+                // Google began issuing AQ.* Gemini Auth keys in 2026. These
+                // still use the official x-goog-api-key header, but some
+                // projects currently return HTTP 401 during the rollout.
+                if (provider == "gemini" && resp.code() == 401
+                    && key.rfind("AQ.", 0) == 0)
+                {
+                    setAuthStatus(
+                        "✗ Gemini AQ key returned HTTP 401. Google's Auth-key "
+                        "rollout is rejecting this request; changing models "
+                        "will not fix the authentication error.",
+                        ui::ERROR_COL
+                    );
+                    return;
+                }
+                setAuthStatus(fmt::format("✗ HTTP {}.", resp.code()),
+                              ui::ERROR_COL);
             });
     }
 
