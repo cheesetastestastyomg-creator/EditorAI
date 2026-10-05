@@ -1,0 +1,26 @@
+name: Build Android64 Mobile Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "mobile-fix-v2"
+      - "mobile-fix-final"
+      - "mobile-fix-build"
+
+jobs:
+  build:
+    name: Android64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Android64
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: 'latest'
+          combine: true
+          target: Android64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EditorAI-Android64-Mobile
+          path: ${{ github.workspace }}/build/*.geode
