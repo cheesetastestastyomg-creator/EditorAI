@@ -2164,6 +2164,20 @@ void drawOverlay() {
         g_keyCapture   = false;          // never leave a capture armed
     }
 
+    // On touch devices the ImGui title-bar X can be physically tiny even
+    // after the overall font scale is increased. Provide a large, explicit
+    // close button inside the panel so the overlay is always easy to dismiss.
+    if (mobile) {
+        float closeWidth = 64.f;
+        float closeHeight = 44.f;
+        ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - closeWidth);
+        if (ImGui::Button("Close", ImVec2(closeWidth, closeHeight))) {
+            g_st.panelOpen = false;
+            g_keyCapture = false;
+        }
+        ImGui::Separator();
+    }
+
     // ── Header bar: status beacon + state text + right-aligned hide hint ──
     {
         int running = 0;
