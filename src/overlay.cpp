@@ -2022,6 +2022,16 @@ void tabSettings() {
 // ── Main draw ─────────────────────────────────────────────────────────────────
 void drawOverlay() {
     float dt = ImGui::GetIO().DeltaTime;
+
+    // Mobile devices have much higher physical pixel density than the
+    // desktop-sized ImGui coordinate system used by Geometry Dash. The panel
+    // already fills the mobile work area; scale the ImGui font so text and
+    // controls are touch-sized without changing the desktop layout.
+    // FontScaleMain is the Dear ImGui 1.92+ replacement for FontGlobalScale.
+    {
+        auto& style = ImGui::GetStyle();
+        style.FontScaleMain = uiMobile() ? 1.75f : 1.0f;
+    }
     if (!g_themeLoaded) loadTheme();
     if (!g_st.persistedLoaded) loadPersistedInputs();
     applyThemeFrame();
