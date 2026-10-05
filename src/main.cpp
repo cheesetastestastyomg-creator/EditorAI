@@ -7966,16 +7966,42 @@ protected:
                  const char* desc = nullptr) {
         auto row = makeRow(lbl, desc);
         float w = 150.f;
+        // API keys get a dedicated clipboard-paste button. Android's
+        // stock IME/paste path can fail for password TextInput fields, so
+        // use Geode's clipboard directly and save the value immediately.
+        bool isApiKey = std::string(sid).find("-api-key") != std::string::npos;
+        if (isApiKey) {
+            w = 110.f;
+        }
         auto in = TextInput::create(w, ph, "bigFont.fnt");
         in->setScale(0.6f);
-        // Right edge pinned at x=354.
-        in->setPosition({354.f - (w * 0.6f) / 2.f, ROW_H / 2.f});
+        // Right edge pinned at x=295 for API-key fields so the Paste
+        // button has its own large touch target on mobile.
+        float inputRight = isApiKey ? 295.f : 354.f;
+        in->setPosition({inputRight - (w * 0.6f) / 2.f, ROW_H / 2.f});
         in->setMaxCharCount(maxLen);
         if (password) in->setPasswordMode(true);
         std::string cur = geode::Mod::get()->getSettingValue<std::string>(sid);
         if (!cur.empty()) in->setString(cur);
         row->addChild(in);
         m_texts.push_back({sid, in, password});
+
+        if (isApiKey) {
+            auto pasteBtn = CCMenuItemSpriteExtra::create(
+                ButtonSprite::create("Paste", "goldFont.fnt", "GJ_button_01.png", 0.45f),
+                this, menu_selector(AISettingsPopup::onPasteApiKey));
+            pasteBtn->setUserObject(CCString::create(sid));
+            pasteBtn->setPosition({332.f, ROW_H / 2.f});
+            auto menu = CCMenu::create();
+            menu->setContentSize({70.f, ROW_H});
+            menu->ignoreAnchorPointForPosition(false);
+            menu->setAnchorPoint({0.5f, 0.5f});
+            menu->setPosition({332.f, ROW_H / 2.f});
+            pasteBtn->setPosition({35.f, ROW_H / 2.f});
+            menu->addChild(pasteBtn);
+            row->addChild(menu);
+        }
+
         pushRow(row);
     }
 
@@ -8624,6 +8650,44 @@ protected:
         if (m_authDot) m_authDot->setColor(col);
     }
 
+    void onPasteApiKey(CCObject* sender) {
+        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
+        auto sidStr = typeinfo_cast<CCString*>(item->getUserObject());
+        if (!sidStr) {
+            setAuthStatus("Paste failed: missing field.", ui::ERROR_COL);
+            return;
+        }
+
+        std::string clip = utils::clipboard::read();
+        auto first = clip.find_first_not_of(" \t\r\n");
+        if (first != std::string::npos) clip.erase(0, first);
+        while (!clip.empty() && (clip.back() == ' ' || clip.back() == '\t' ||
+                                 clip.back() == '\r' || clip.back() == '\n'))
+            clip.pop_back();
+
+        if (clip.empty()) {
+            setAuthStatus("Clipboard is empty.", ui::ERROR_COL);
+            return;
+        }
+
+        bool found = false;
+        for (auto& r : m_texts) {
+            if (r.sid == sidStr->getCString()) {
+                r.in->setString(clip);
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            setAuthStatus("Paste failed: key field not found.", ui::ERROR_COL);
+            return;
+        }
+
+        flushInputs();
+        setAuthStatus("Key pasted and saved. Tap Save & test.", ui::SUCCESS_COL);
+    }
+
     void onOpenKeyPage(CCObject*) {
         std::string p = geode::Mod::get()->getSettingValue<std::string>("ai-provider");
         const char* url = nullptr;
@@ -8686,10 +8750,27 @@ protected:
         // Same headers the real generation requests use.
         applyProviderAuth(req, provider, key);
         m_authNet.spawn(req.get(url),
-            [this](web::WebResponse resp) {
-                if (resp.ok()) setAuthStatus("✓ Connected.", ui::SUCCESS_COL);
-                else setAuthStatus(fmt::format("✗ HTTP {}.", resp.code()),
-                                   ui::ERROR_COL);
+            [this, provider, key](web::WebResponse resp) {
+                if (resp.ok()) {
+                    setAuthStatus("✓ Connected.", ui::SUCCESS_COL);
+                    return;
+                }
+                // Google began issuing AQ.* Gemini Auth keys in 2026. These
+                // still use the official x-goog-api-key header, but some
+                // projects currently return HTTP 401 during the rollout.
+                if (provider == "gemini" && resp.code() == 401
+                    && key.rfind("AQ.", 0) == 0)
+                {
+                    setAuthStatus(
+                        "✗ Gemini AQ key returned HTTP 401. Google's Auth-key "
+                        "rollout is rejecting this request; changing models "
+                        "will not fix the authentication error.",
+                        ui::ERROR_COL
+                    );
+                    return;
+                }
+                setAuthStatus(fmt::format("✗ HTTP {}.", resp.code()),
+                              ui::ERROR_COL);
             });
     }
 
