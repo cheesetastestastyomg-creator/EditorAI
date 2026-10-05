@@ -7966,16 +7966,42 @@ protected:
                  const char* desc = nullptr) {
         auto row = makeRow(lbl, desc);
         float w = 150.f;
+        // API keys get a dedicated clipboard-paste button. Android's
+        // stock IME/paste path can fail for password TextInput fields, so
+        // use Geode's clipboard directly and save the value immediately.
+        bool isApiKey = std::string(sid).find("-api-key") != std::string::npos;
+        if (isApiKey) {
+            w = 110.f;
+        }
         auto in = TextInput::create(w, ph, "bigFont.fnt");
         in->setScale(0.6f);
-        // Right edge pinned at x=354.
-        in->setPosition({354.f - (w * 0.6f) / 2.f, ROW_H / 2.f});
+        // Right edge pinned at x=295 for API-key fields so the Paste
+        // button has its own large touch target on mobile.
+        float inputRight = isApiKey ? 295.f : 354.f;
+        in->setPosition({inputRight - (w * 0.6f) / 2.f, ROW_H / 2.f});
         in->setMaxCharCount(maxLen);
         if (password) in->setPasswordMode(true);
         std::string cur = geode::Mod::get()->getSettingValue<std::string>(sid);
         if (!cur.empty()) in->setString(cur);
         row->addChild(in);
         m_texts.push_back({sid, in, password});
+
+        if (isApiKey) {
+            auto pasteBtn = CCMenuItemSpriteExtra::create(
+                ButtonSprite::create("Paste", "goldFont.fnt", "GJ_button_01.png", 0.45f),
+                this, menu_selector(AISettingsPopup::onPasteApiKey));
+            pasteBtn->setUserObject(CCString::create(sid));
+            pasteBtn->setPosition({332.f, ROW_H / 2.f});
+            auto menu = CCMenu::create();
+            menu->setContentSize({70.f, ROW_H});
+            menu->ignoreAnchorPointForPosition(false);
+            menu->setAnchorPoint({0.5f, 0.5f});
+            menu->setPosition({332.f, ROW_H / 2.f});
+            pasteBtn->setPosition({35.f, ROW_H / 2.f});
+            menu->addChild(pasteBtn);
+            row->addChild(menu);
+        }
+
         pushRow(row);
     }
 
@@ -8622,6 +8648,49 @@ protected:
         // The dot carries the state too — text glyphs like ✓/✗ don't exist
         // in bigFont and drop silently.
         if (m_authDot) m_authDot->setColor(col);
+    }
+
+    void onPasteApiKey(CCObject* sender) {
+        auto sidObj = sender->getUserObject();
+        auto sidStr = typeinfo_cast<CCString*>(sidObj);
+        if (!sidStr) {
+            setAuthStatus("Paste failed: missing field.", ui::ERROR_COL);
+            return;
+        }
+
+        std::string clip = utils::clipboard::read();
+        // Strip only outer whitespace commonly introduced by copying.
+        auto first = clip.find_first_not_of(" 	
+");
+        if (first != std::string::npos) clip.erase(0, first);
+        while (!clip.empty() && (clip.back() == ' ' || clip.back() == '	' ||
+                                 clip.back() == '' || clip.back() == '
+'))
+            clip.pop_back();
+
+        if (clip.empty()) {
+            setAuthStatus("Clipboard is empty.", ui::ERROR_COL);
+            return;
+        }
+
+        bool found = false;
+        for (auto& r : m_texts) {
+            if (r.sid == sidStr->getCString()) {
+                r.in->setString(clip);
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            setAuthStatus("Paste failed: key field not found.", ui::ERROR_COL);
+            return;
+        }
+
+        // Persist immediately. Do not depend on the Android keyboard's
+        // Done/checkmark action to trigger the popup's close handler.
+        flushInputs();
+        setAuthStatus("Key pasted and saved. Tap Save & test.", ui::SUCCESS_COL);
     }
 
     void onOpenKeyPage(CCObject*) {
