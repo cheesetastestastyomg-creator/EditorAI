@@ -7,6 +7,7 @@ on:
       - "mobile-fix-v2"
       - "mobile-fix-final"
       - "mobile-fix-build"
+      - "mobile-fix-release2"
 
 jobs:
   build:
