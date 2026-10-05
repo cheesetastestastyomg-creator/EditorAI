@@ -2,6 +2,9 @@ name: Build EditorAI
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - fix/gemini-auth-aq
 
 jobs:
   build:
