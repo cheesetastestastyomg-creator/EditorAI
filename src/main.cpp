@@ -8651,21 +8651,18 @@ protected:
     }
 
     void onPasteApiKey(CCObject* sender) {
-        auto sidObj = sender->getUserObject();
-        auto sidStr = typeinfo_cast<CCString*>(sidObj);
+        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
+        auto sidStr = typeinfo_cast<CCString*>(item->getUserObject());
         if (!sidStr) {
             setAuthStatus("Paste failed: missing field.", ui::ERROR_COL);
             return;
         }
 
         std::string clip = utils::clipboard::read();
-        // Strip only outer whitespace commonly introduced by copying.
-        auto first = clip.find_first_not_of(" 	
-");
+        auto first = clip.find_first_not_of(" \t\r\n");
         if (first != std::string::npos) clip.erase(0, first);
-        while (!clip.empty() && (clip.back() == ' ' || clip.back() == '	' ||
-                                 clip.back() == '' || clip.back() == '
-'))
+        while (!clip.empty() && (clip.back() == ' ' || clip.back() == '\t' ||
+                                 clip.back() == '\r' || clip.back() == '\n'))
             clip.pop_back();
 
         if (clip.empty()) {
@@ -8687,8 +8684,6 @@ protected:
             return;
         }
 
-        // Persist immediately. Do not depend on the Android keyboard's
-        // Done/checkmark action to trigger the popup's close handler.
         flushInputs();
         setAuthStatus("Key pasted and saved. Tap Save & test.", ui::SUCCESS_COL);
     }
